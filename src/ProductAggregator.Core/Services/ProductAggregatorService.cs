@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using ProductAggregator.Core.Interfaces;
 using ProductAggregator.Core.Models;
+using Microsoft.Extensions.Caching.Distributed;
+using System.Text.Json;
 
 namespace ProductAggregator.Core.Services;
 
@@ -9,12 +11,17 @@ public class ProductAggregatorService : IProductAggregatorService
     private readonly IEnumerable<IPriceProvider> _priceProviders;
     private readonly IEnumerable<IStockProvider> _stockProviders;
 
+    private readonly IDistributedCache _cache;
+    private static readonly SemaphoreSlim _semaphore = new(10);
+
     public ProductAggregatorService(
         IEnumerable<IPriceProvider> priceProviders,
-        IEnumerable<IStockProvider> stockProviders)
+        IEnumerable<IStockProvider> stockProviders,
+        IDistributedCache cache)
     {
         _priceProviders = priceProviders;
         _stockProviders = stockProviders;
+        _cache = cache;
     }
 
     public async Task<AggregatedProductResponse> AggregateProductsAsync(
@@ -27,28 +34,49 @@ public class ProductAggregatorService : IProductAggregatorService
             TotalRequested = request.ProductIds.Count
         };
 
-        foreach (var productId in request.ProductIds)
+
+
+        var tasks = request.ProductIds.Select(async productId =>
         {
+            await _semaphore.WaitAsync(cancellationToken);
             try
             {
-                var product = await GetProductInternalAsync(productId, request);
-                if (product != null)
-                {
-                    response.Products.Add(product);
-                    response.TotalSuccessful++;
-                }
+                var product = await GetProductInternalAsync(productId, request, cancellationToken);
+                return (product, error: (string?)null);
             }
             catch (Exception ex)
             {
-                response.Errors.Add($"Failed to process product {productId}: {ex.Message}");
+                return (product: (Product?)null, error: $"Failed to process product {productId}, error: {ex.Message}");
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        });
+
+        var results = await Task.WhenAll(tasks);
+
+        foreach (var result in results)
+        {
+            if (result.product != null)
+            {
+                response.Products.Add(result.product);
+                response.TotalSuccessful++;
+            }
+
+            if (result.error != null)
+            {
+                response.Errors.Add(result.error);
             }
         }
 
         stopwatch.Stop();
         response.ProcessingTimeMs = stopwatch.ElapsedMilliseconds;
-        
+
         return response;
     }
+
+
 
     public async Task<Product?> GetProductAsync(string productId, CancellationToken cancellationToken = default)
     {
@@ -56,12 +84,25 @@ public class ProductAggregatorService : IProductAggregatorService
         {
             ProductIds = new List<string> { productId }
         };
-        
-        return await GetProductInternalAsync(productId, request);
+
+        return await GetProductInternalAsync(productId, request, cancellationToken);
     }
 
-    private async Task<Product?> GetProductInternalAsync(string productId, AggregatedProductRequest request)
+    private async Task<Product?> GetProductInternalAsync(string productId, AggregatedProductRequest request, CancellationToken cancellationToken = default)
     {
+        var cacheKey = $"product:{productId}:prices:{request.IncludePrices}:stock:{request.IncludeStock}";
+
+        try
+        {
+            var cachedProduct = await _cache.GetStringAsync(cacheKey, cancellationToken);
+            if (cachedProduct != null)
+            {
+                return JsonSerializer.Deserialize<Product>(cachedProduct);
+            }
+
+        }
+        catch { }
+
         var product = new Product
         {
             Id = productId,
@@ -70,43 +111,32 @@ public class ProductAggregatorService : IProductAggregatorService
             Category = GetCategoryFromId(productId)
         };
 
-        if (request.IncludePrices)
-        {
-            foreach (var provider in _priceProviders)
-            {
-                try
-                {
-                    var priceResponse = await provider.GetPriceAsync(productId);
-                    if (priceResponse.Success && priceResponse.PriceInfo != null)
-                    {
-                        product.Prices.Add(priceResponse.PriceInfo);
-                    }
-                }
-                catch
-                {
-                    // Provider failed, continue with next
-                }
-            }
-        }
 
-        if (request.IncludeStock)
+        var priceTask = request.IncludePrices
+        ? GetPricesAsync(productId, cancellationToken)
+        : Task.FromResult(new List<PriceInfo>());
+
+        var stockTask = request.IncludeStock
+            ? GetStockAsync(productId, cancellationToken)
+            : Task.FromResult(new List<StockInfo>());
+
+        await Task.WhenAll(priceTask, stockTask);
+
+        var prices = priceTask.Result;
+        var stocks = stockTask.Result;
+
+        try
         {
-            foreach (var provider in _stockProviders)
+            var cacheOptions = new DistributedCacheEntryOptions
             {
-                try
-                {
-                    var stockResponse = await provider.GetStockAsync(productId);
-                    if (stockResponse.Success)
-                    {
-                        product.StockLevels.AddRange(stockResponse.StockInfos);
-                    }
-                }
-                catch
-                {
-                    // Provider failed, continue with next
-                }
-            }
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5)
+            };
+
+            var serializedProduct = JsonSerializer.Serialize(product);
+            await _cache.SetStringAsync(cacheKey, serializedProduct, cacheOptions, cancellationToken);
+
         }
+        catch { }
 
         return product;
     }
@@ -116,5 +146,56 @@ public class ProductAggregatorService : IProductAggregatorService
         var hash = Math.Abs(productId.GetHashCode());
         var categories = new[] { "Electronics", "Clothing", "Home", "Sports", "Books", "Toys" };
         return categories[hash % categories.Length];
+    }
+
+    private async Task<List<PriceInfo>> GetPricesAsync(
+    string productId,
+    CancellationToken cancellationToken)
+    {
+        var priceTasks = _priceProviders.Select(async provider =>
+        {
+            try
+            {
+                var response = await provider.GetPriceAsync(productId, cancellationToken);
+                return response.Success ? response.PriceInfo : null;
+            }
+            catch
+            {
+                return null;
+            }
+        });
+
+        var prices = await Task.WhenAll(priceTasks);
+
+        return prices
+            .Where(p => p != null)
+            .Select(p => p!)
+            .ToList();
+    }
+
+
+    private async Task<List<StockInfo>> GetStockAsync(
+    string productId,
+    CancellationToken cancellationToken)
+    {
+        var stockTasks = _stockProviders.Select(async provider =>
+        {
+            try
+            {
+                var response = await provider.GetStockAsync(productId, cancellationToken);
+                return response.Success ? response.StockInfos : null;
+            }
+            catch
+            {
+                return null;
+            }
+        });
+
+        var stocks = await Task.WhenAll(stockTasks);
+
+        return stocks
+            .Where(s => s != null)
+            .SelectMany(s => s!)
+            .ToList();
     }
 }
