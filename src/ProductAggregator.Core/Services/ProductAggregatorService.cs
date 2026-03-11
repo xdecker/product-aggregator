@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using ProductAggregator.Core.Interfaces;
 using ProductAggregator.Core.Models;
+using Microsoft.Extensions.Caching.Distributed;
+using System.Text.Json;
 
 namespace ProductAggregator.Core.Services;
 
@@ -9,14 +11,17 @@ public class ProductAggregatorService : IProductAggregatorService
     private readonly IEnumerable<IPriceProvider> _priceProviders;
     private readonly IEnumerable<IStockProvider> _stockProviders;
 
+    private readonly IDistributedCache _cache;
     private static readonly SemaphoreSlim _semaphore = new(10);
 
     public ProductAggregatorService(
         IEnumerable<IPriceProvider> priceProviders,
-        IEnumerable<IStockProvider> stockProviders)
+        IEnumerable<IStockProvider> stockProviders,
+        IDistributedCache cache)
     {
         _priceProviders = priceProviders;
         _stockProviders = stockProviders;
+        _cache = cache;
     }
 
     public async Task<AggregatedProductResponse> AggregateProductsAsync(
@@ -85,6 +90,19 @@ public class ProductAggregatorService : IProductAggregatorService
 
     private async Task<Product?> GetProductInternalAsync(string productId, AggregatedProductRequest request, CancellationToken cancellationToken = default)
     {
+        var cacheKey = $"product:{productId}:prices:{request.IncludePrices}:stock:{request.IncludeStock}";
+
+        try
+        {
+            var cachedProduct = await _cache.GetStringAsync(cacheKey, cancellationToken);
+            if (cachedProduct != null)
+            {
+                return JsonSerializer.Deserialize<Product>(cachedProduct);
+            }
+
+        }
+        catch { }
+
         var product = new Product
         {
             Id = productId,
@@ -107,6 +125,19 @@ public class ProductAggregatorService : IProductAggregatorService
 
         product.Prices.AddRange(prices);
         product.StockLevels.AddRange(stocks);
+
+        try
+        {
+            var cacheOptions = new DistributedCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5)
+            };
+
+            var serializedProduct = JsonSerializer.Serialize(product);
+            await _cache.SetStringAsync(cacheKey, serializedProduct, cacheOptions, cancellationToken);
+
+        }
+        catch { }
 
         return product;
     }

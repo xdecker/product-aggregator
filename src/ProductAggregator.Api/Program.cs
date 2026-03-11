@@ -1,6 +1,7 @@
 using ProductAggregator.Core.Factories;
 using ProductAggregator.Core.Interfaces;
 using ProductAggregator.Core.Services;
+using ProductAggregator.Core.Models;
 using ProductAggregator.Core.Services.MockProviders;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -11,6 +12,33 @@ builder.Services.AddControllers();
 // Add OpenAPI/Swagger
 builder.Services.AddOpenApi();
 builder.Services.AddEndpointsApiExplorer();
+
+var redisEnabled = builder.Configuration.GetValue<bool>("Redis:Enabled");
+
+builder.Services.Configure<RedisSettings>(
+    builder.Configuration.GetSection("Redis"));
+
+var redisSettings = builder.Configuration
+    .GetSection("Redis")
+    .Get<RedisSettings>();
+
+if (redisEnabled)
+{
+    builder.Services.AddStackExchangeRedisCache(options =>
+    {
+        options.Configuration = redisSettings!.ConnectionString;
+        options.InstanceName = redisSettings.InstanceName;
+    });
+}
+else
+{
+    builder.Services.AddDistributedMemoryCache();
+}
+
+Console.WriteLine(
+    redisEnabled
+        ? "Redis cache enabled"
+        : "Using in-memory cache");
 
 // Provider Factory
 builder.Services.AddSingleton<IProviderFactory, ProviderFactory>();
