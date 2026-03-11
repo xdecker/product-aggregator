@@ -120,11 +120,10 @@ public class ProductAggregatorService : IProductAggregatorService
             ? GetStockAsync(productId, cancellationToken)
             : Task.FromResult(new List<StockInfo>());
 
-        var prices = await priceTask;
-        var stocks = await stockTask;
+        await Task.WhenAll(priceTask, stockTask);
 
-        product.Prices.AddRange(prices);
-        product.StockLevels.AddRange(stocks);
+        var prices = priceTask.Result;
+        var stocks = stockTask.Result;
 
         try
         {
